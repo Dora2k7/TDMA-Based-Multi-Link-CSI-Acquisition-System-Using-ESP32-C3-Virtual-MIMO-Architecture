@@ -7,358 +7,213 @@
 
 ![System Architecture Overview](docs/system_architecture.png)
 
-*Figure 1. Complete system overview showing (1) the 4-node Virtual MIMO topology with 12-slot TDMA schedule, (2) raw CSI data matrix structure and USB data pipeline, and (3) the three-stage signal processing pipeline (Hampel → Gaussian → PCA).*
-
----
-
-## Table of Contents
-
-- [1. Introduction](#1-introduction)
-- [2. Hardware Platform: ESP32-C3](#2-hardware-platform-esp32-c3)
-- [3. System Architecture](#3-system-architecture-1)
-- [4. Signal Processing Pipeline](#4-signal-processing-pipeline)
-- [5. Experimental Results](#5-experimental-results)
-- [6. Limitations and Future Work](#6-limitations-and-future-work)
+*Figure 1. Complete system overview: (1) 4-node Virtual MIMO topology with 12-slot TDMA schedule, (2) raw CSI data matrix and USB data pipeline, (3) signal processing pipeline (Hampel → Gaussian → PCA).*
 
 ---
 
 ## 1. Introduction
 
-Channel State Information (CSI) extracted from commercial WiFi transceivers has emerged as a promising modality for device-free sensing, enabling applications such as Human Activity Recognition (HAR), gesture detection, and pose estimation without requiring users to carry dedicated sensors. However, CSI obtained from a single-link Single-Input Single-Output (SISO) transceiver provides limited spatial diversity, constraining the discriminative power of downstream machine learning models.
+Channel State Information (CSI) describes how a wireless signal propagates between a transmitter and a receiver — capturing the combined effects of path loss, multipath reflections, scattering, and fading across each OFDM subcarrier. When a person moves within the propagation environment, their body alters the multipath structure, producing measurable variations in CSI amplitude and phase. This makes CSI a powerful modality for **device-free sensing** applications including Human Activity Recognition (HAR) and Pose Estimation.
 
-This work presents the design and implementation of a low-cost, multi-link CSI acquisition platform based on a **Virtual MIMO** architecture, employing **TDMA-based Multi-Link CSI Acquisition**. The system exploits *N* = 4 SISO transceiver nodes operating under a Time-Division Multiple Access (TDMA) schedule to produce *N*(*N*−1) = 12 independent wireless links per measurement cycle. Each link captures a distinct spatial perspective of the monitored environment, collectively providing channel diversity equivalent to a distributed antenna array — realized entirely through time-multiplexing of inexpensive single-antenna hardware.
+However, CSI from a single SISO link provides only one spatial perspective, limiting the ability of AI models to distinguish complex activities. This project addresses that limitation by constructing a **Virtual MIMO** system: 4 single-antenna ESP32-C3 nodes coordinated via **TDMA-based Multi-Link CSI Acquisition**, producing **12 independent wireless links** per measurement cycle — each capturing a distinct spatial view of the environment.
 
 ---
 
-## 2. Hardware Platform: ESP32-C3
+## 2. How CSI Is Generated via ESP-NOW
 
-### 2.1. Device Specifications
+### 2.1. Physical-Layer CSI Extraction
 
-The ESP32-C3, manufactured by Espressif Systems, is a single-core RISC-V 32-bit microcontroller integrating an IEEE 802.11 b/g/n transceiver operating in the 2.4 GHz ISM band with 20 MHz channel bandwidth (HT20). It supports physical-layer CSI extraction from the Long Training Field (LTF) via the ESP-IDF SDK and features a built-in USB Serial JTAG interface capable of sustaining data rates up to 2,000,000 baud without external UART-USB bridge circuitry.
+In an OFDM-based WiFi system (IEEE 802.11n), every transmitted frame begins with a **preamble** containing known reference signals called **Long Training Fields (LTF)**. These LTF sequences are predefined by the standard — both the transmitter and receiver know exactly what was sent.
 
-### 2.2. Rationale for Selection
+When the receiver's WiFi hardware captures an incoming frame, it compares the **received** LTF with the **expected** LTF for each OFDM subcarrier. The complex ratio between them yields the **Channel Frequency Response (CFR)** — this is CSI:
 
-The ESP32-C3 was chosen based on the following criteria:
+> **CSI = H(f) = Y(f) / X(f)**
+> 
+> where *Y(f)* is the received signal and *X(f)* is the known transmitted signal at subcarrier frequency *f*.
 
-| Criterion | Detail |
-|:---|:---|
-| Cost | Low unit cost enabling multi-node deployment |
-| Form factor | Compact size suitable for unobtrusive installation |
-| Communication | Native ESP-NOW peer-to-peer protocol with sub-millisecond latency |
-| CSI access | Firmware-level access to raw CSI buffers (amplitude + phase) |
+Each subcarrier's CSI is a complex number (I + jQ) encoding both **amplitude** (signal attenuation) and **phase** (propagation delay). The ESP32-C3 reports these as signed 8-bit integer pairs (I, Q) for each subcarrier.
 
-### 2.3. Limitations and Architectural Consequences
+### 2.2. Why ESP-NOW Triggers CSI
 
-Despite its advantages, the ESP32-C3 exhibits several constraints that directly shaped the system architecture:
+**ESP-NOW** is Espressif's connectionless peer-to-peer protocol operating at the MAC layer. It requires no WiFi association, no router, and no handshake — a node simply transmits a frame to a known MAC address. Crucially for this project:
 
-| Limitation | Impact | Design Decision |
+- Every ESP-NOW frame is a standard 802.11 action frame with a **full OFDM preamble** (including LTFs).
+- The receiving node's WiFi hardware **automatically** extracts CSI from this preamble, independent of the frame's payload content.
+- The ESP-IDF firmware exposes this CSI via a registered callback (`wifi_csi_cb`), which fires on every received frame.
+
+Therefore, each ESP-NOW Probe packet in the TDMA schedule serves a **dual purpose**: (1) it carries control data (round_id, tx_id, sequence number) for the TDMA protocol, and (2) its physical-layer preamble triggers CSI extraction at the receiver — all within a single over-the-air transmission.
+
+### 2.3. CSI Configuration
+
+The firmware configures CSI extraction as follows:
+
+| Setting | Value | Effect |
+|:---|:---:|:---|
+| `lltf_en` | `true` | Extract CSI from Legacy LTF |
+| `htltf_en` | `true` | Extract CSI from HT-LTF |
+| `ltf_merge_en` | `true` | Merge both LTFs → 128 bytes = **64 subcarriers** (I/Q pairs) |
+| `stbc_htltf2_en` | `false` | Disabled — ESP32-C3 has no STBC support |
+| `channel_filter_en` | `false` | Raw CSI without hardware smoothing |
+
+After removing the DC subcarrier (index 0) and guard band (indices 27–37), **52 clean subcarriers** remain per link.
+
+---
+
+## 3. ESP32-C3 WiFi Capabilities and Design Impact
+
+The ESP32-C3's WiFi radio has specific capabilities and constraints that directly determined the system architecture:
+
+| WiFi Feature | ESP32-C3 Specification | Design Impact |
 |:---|:---|:---|
-| **SISO-only** radio chain | No native spatial multiplexing | → Multi-node Virtual MIMO topology |
-| **Single-core** CPU, no DSP | Cannot process multi-link CSI in real-time | → Offload all filtering/PCA to host PC |
-| **`first_word_invalid`** errata | First 4 bytes of CSI buffer may be corrupted | → Firmware-level deterministic zeroing |
+| **Antenna config** | 1T1R (single antenna) | SISO only → requires multi-node Virtual MIMO topology |
+| **Bandwidth** | HT20 only (20 MHz) | 64 OFDM subcarriers; no HT40 option to double resolution |
+| **Frequency band** | 2.4 GHz only | Good wall penetration for indoor sensing; higher interference risk |
+| **MIMO support** | None | Cannot extract spatial streams → each node is one "virtual antenna" |
+| **PHY rates** | MCS0–MCS7 | MCS0 (BPSK, rate 1/2) chosen for maximum robustness |
+| **STBC** | Not supported | `stbc_htltf2_en` disabled; no space-time coding gain |
+| **ESP-NOW latency** | < 1 ms | Enables sub-millisecond TDMA slot coordination |
+| **CSI buffer size** | 128 bytes (merged LTF) | 64 subcarriers × 2 bytes (I, Q) per subcarrier |
+| **CPU** | Single-core RISC-V | Insufficient for real-time DSP → offload to PC |
+| **USB interface** | Built-in USB Serial JTAG | 2 Mbaud; no external UART bridge needed |
+
+**Key architectural consequence:** Because each ESP32-C3 has only **one antenna** and **no MIMO capability**, the only way to achieve spatial diversity is to deploy **multiple nodes** at different physical locations. The **Virtual MIMO** approach — where 4 SISO nodes generate 12 links through TDMA scheduling — is a direct response to this hardware limitation.
 
 ---
 
-## 3. System Architecture
+## 4. TDMA System Design
 
-### 3.1. Hardware Topology
+### 4.1. Timing Budget
 
-The system comprises four ESP32-C3 nodes connected to a host PC through a USB Hub. All nodes operate on **WiFi Channel 11** (2.462 GHz) in Station mode. Inter-node communication uses **ESP-NOW** at HT20 / MCS0 (BPSK, coding rate 1/2), chosen for robustness against channel fading. Maximum transmit power is configured at **13 dBm**.
+| Parameter | Value |
+|:---|---:|
+| Nodes (*N*) | 4 |
+| Slots per cycle | *N*(*N*−1) = 12 |
+| Slot duration | 2,000 µs |
+| Cycle period | 24 ms |
+| Theoretical max FPS | **41.67 fps** |
+| ACK timeout | 500 µs per attempt |
+| Retries | 1 |
+| Guard time per slot | 1,000 µs |
 
-### 3.2. TDMA Schedule Design
+### 4.2. Slot Protocol
 
-**Node 0** serves as the TDMA Master, maintaining the global cycle counter (`round_id`) and providing timing reference. Nodes 1–3 operate as Slaves. Each TDMA cycle comprises **12 time slots**, one for each ordered transmitter–receiver pair in the full-mesh topology.
+Within each 2,000 µs slot:
 
-**TDMA Timing Budget:**
+1. **TX** sends Probe packet `{type=1, tx_id, round_id, seq}` via ESP-NOW
+2. **RX** hardware extracts CSI from preamble → enqueued with `round_id` (captured atomically in ISR)
+3. **RX** software returns ACK `{type=2, tx_id, seq}`
+4. **TX** waits up to 500 µs for ACK; retries once if needed
+5. Remaining ~1,000 µs: CRC16 computation + USB write
 
-| Parameter | Symbol | Value |
-|:---|:---:|---:|
-| Number of nodes | *N* | 4 |
-| Slots per cycle | *N*_slot | 12 |
-| Slot duration | *T*_slot | 2,000 µs |
-| Cycle period | *T*_cycle | 24,000 µs (24 ms) |
-| Theoretical max frame rate | *f*_max | **41.67 fps** |
-| ACK timeout per attempt | *T*_ack | 500 µs |
-| Maximum retries | *R* | 1 |
-| Worst-case active time | *T*_active | 1,000 µs |
-| Guard time | *T*_guard | 1,000 µs |
+### 4.3. Synchronization
 
-**Slot-level protocol:** Within each slot, the designated transmitter sends a Probe packet via ESP-NOW. Upon reception, the receiver: (a) extracts CSI from the physical-layer preamble and enqueues it with the current `round_id` captured atomically inside the ISR callback, and (b) returns an ACK packet. If no ACK is received within 500 µs, a single retry is attempted. The remaining 1,000 µs guard time accommodates CRC16 computation and USB Serial JTAG write operations.
+**Node 0 (Master)** maintains the global `round_id`. When Slaves receive the Master's first Probe of a new round, they enter a critical section, reset their slot counter, and restart their hardware timer — re-synchronizing every 24 ms to suppress crystal oscillator drift.
 
-### 3.3. Inter-Node Synchronization (Hard Sync)
+### 4.4. Binary Protocol (ESP32 → PC)
 
-Clock drift between independent crystal oscillators is suppressed by a **Hard Sync** mechanism. When a Slave node receives the Master's first Probe of a new `round_id`, it:
+```
+[Magic 4B: 0x43534921] [round_id 4B] [tx_id 1B] [rx_id 1B] [RSSI 1B] [csi_len 2B] [CSI payload] [CRC16 2B]
+```
 
-1. Enters a critical section (`portDISABLE_INTERRUPTS()`),
-2. Resets its local slot counter to the expected position based on its node ID,
-3. Exits the critical section and restarts the hardware timer.
-
-This re-synchronization occurs **once per cycle (every 24 ms)**, preventing drift accumulation.
-
-### 3.4. Binary Transmission Protocol
-
-| Field | Size | Description |
-|:---|:---:|:---|
-| Magic word | 4 B | `0x43534921` ("CSI!" little-endian) |
-| `round_id` | 4 B | TDMA cycle identifier |
-| `tx_id` | 1 B | Transmitter node index (0–3) |
-| `rx_id` | 1 B | Receiver node index (0–3) |
-| RSSI | 1 B | Received signal strength (dBm, signed) |
-| `csi_len` | 2 B | CSI payload length |
-| CSI payload | *csi_len* B | Raw I/Q samples (int8 pairs) |
-| CRC16-CCITT | 2 B | Integrity checksum |
-
-On the host side, **four concurrent reader threads** (one per COM port) perform buffered binary parsing with magic word resynchronization. Records failing CRC16 verification are silently discarded. A **garbage collector** purges incomplete rounds when the current `round_id` exceeds theirs by more than 10 units, preventing memory leaks during long-duration operation.
-
-### 3.5. Subcarrier Selection
-
-Each raw CSI vector contains **64 subcarriers** (LLTF, HT20). The following are removed:
-
-- **Subcarrier 0** — DC component (carrier frequency offset corruption)
-- **Subcarriers 27–37** — Guard band (no channel information)
-
-The remaining **52 clean subcarriers** yield a per-frame CSI amplitude matrix of dimension **52 × 12**.
+Four concurrent reader threads (one per COM port) parse the binary stream. CRC16-CCITT failures are silently discarded. A garbage collector purges incomplete rounds (lag > 10) to prevent memory leaks.
 
 ---
 
-## 4. Signal Processing Pipeline
+## 5. Signal Processing Pipeline
+
+Raw CSI frames pass through three sequential stages before being consumed by AI models:
 
 ```
-Raw CSI (52×12) → Hampel Filter → Gaussian Filter → Online PCA → Output (52×5)
-                   (temporal)      (subcarrier)       (link)
+Raw CSI (52×12) → Hampel → Gaussian → Online PCA → Output (52×5)
 ```
 
-The ordering is deliberate: **Hampel before Gaussian** prevents spike energy from spreading through the convolution kernel; **Gaussian before PCA** ensures the covariance matrix is not distorted by inter-subcarrier noise.
-
-### 4.1. Stage 1 — Hampel Filter (Temporal Domain)
-
-Operates independently on each of the 52 × 12 = 624 CSI amplitude time series to detect and replace impulsive outliers.
-
-For a time series *x*(*t*) with sliding window *W_t* of size *W* = 2*m* + 1 centered at *t*:
-
-```
-x̃(t) = median(W_t)
-
-MAD(t) = median({ |x(i) − x̃(t)| }  for i = t−m ... t+m)
-
-σ̂(t) = 1.4826 × MAD(t)
-```
-
-A sample is classified as an **outlier** and replaced by the median if:
-
-```
-|x(t) − x̃(t)| > n_σ × σ̂(t)   AND   MAD(t) > ε
-```
-
-| Parameter | Value | Description |
-|:---|:---:|:---|
-| Window size (*W*) | 7 frames | Sliding window width |
-| Threshold (*n*_σ) | 2.5 | Sigma multiplier |
-| Floor (ε) | 10⁻⁹ | Prevents false detection on flat signals |
-| Latency | 3 frames | ⌊*W*/2⌋ frames delay |
-
-### 4.2. Stage 2 — Gaussian Filter (Subcarrier Domain)
-
-A 1D Gaussian convolution along the subcarrier axis of each frame, targeting EMI sawtooth noise between adjacent subcarriers.
-
-```
-G(u) = (1 / √(2π)·σ_g) · exp(−u² / (2·σ_g²))
-```
-
-| Parameter | Value | Description |
-|:---|:---:|:---|
-| Sigma (σ_g) | 0.8 | Kernel standard deviation |
-| Kernel size (*K*) | 7 | 2·⌈3·σ_g⌉ + 1 |
-| Boundary | Reflect | Mirror padding at edges |
-
-### 4.3. Stage 3 — Online Spatial PCA with Temporal Detrending
-
-Reduces link dimension from *L* = 12 to *k* = 5 principal components, capturing dominant motion-related variance.
-
-**Step 1 — DC elimination (Temporal detrending):**
-
-```
-M_t = (1 − α)·M_{t−1} + α·X_t       (α = 0.05, τ = 20 frames)
-Z_t = X_t − M_t                        (AC component)
-```
-
-**Step 2 — Recursive spatial covariance estimation:**
-
-```
-C_inst,t = (1/(S−1))·Z_t^T·Z_t
-C_t = (1 − β)·C_{t−1} + β·C_inst,t    (β = 0.05, τ = 20 frames)
-```
-
-**Step 3 — Eigendecomposition + Sign Alignment:**
-
-The top-*k* eigenvectors of *C_t* form projection matrix **P_t** ∈ ℝ^(12×5). To prevent random sign flips:
-
-```
-v_j^(t) ← sign(⟨v_j^(t), v_j^(t−1)⟩) · v_j^(t)
-```
-
-with dead-zone |dot| < 0.1 to avoid erroneous flips near eigenvalue crossings.
-
-**Step 4 — Projection:**
-
-```
-X_{t,pca} = Z_t · P_t ∈ ℝ^(52×5)
-```
-
-A **warm-up phase of 5 frames** ensures the running mean is initialized from averaged data.
-
-### 4.4. Pipeline Summary
-
-| Stage | Domain | Dimension | Purpose | Key Parameters |
+| Stage | Domain | Dim | Purpose | Key Params |
 |:---|:---|:---:|:---|:---|
-| Hampel | Temporal | 52×12 → 52×12 | Impulsive spike removal | *W*=7, *n*_σ=2.5 |
-| Gaussian | Subcarrier | 52×12 → 52×12 | EMI smoothing | σ_g=0.8, *K*=7 |
-| PCA | Link | 52×12 → 52×5 | Dimensionality reduction | *k*=5, α=0.05, β=0.05 |
+| **Hampel Filter** | Temporal (per element) | 52×12 → 52×12 | Remove impulsive spikes using MAD-based robust statistics | *W*=7, *n*σ=2.5 |
+| **Gaussian Filter** | Subcarrier (per frame) | 52×12 → 52×12 | Smooth EMI sawtooth noise between adjacent subcarriers | σ=0.8, *K*=7 |
+| **Online PCA** | Link (per frame) | 52×12 → 52×5 | Reduce 12 links to 5 principal components; suppress static reflections via temporal detrending (EMA) | *k*=5, α=0.05, β=0.05 |
+
+The ordering is deliberate: Hampel runs first to prevent spike propagation through the Gaussian convolution kernel; Gaussian runs before PCA to avoid distorting the inter-link covariance matrix.
 
 ---
 
-## 5. Experimental Results
+## 6. Experimental Results
 
-### 5.1. Measurement Conditions
-
-Two measurement campaigns were conducted under different configurations:
+### 6.1. Measurement Conditions
 
 | | Run A | Run B |
 |:---|:---|:---|
-| **TDMA config** | Previous configuration (conservative timing) | Current configuration (*T*_slot = 2,000 µs) |
-| **Environment** | Indoor laboratory | University library (ambient WiFi interference) |
-| **Duration** | 105.3 s (sustained) | 7.2 s (pilot measurement) |
-| **Purpose** | Stability assessment over extended session | Functional verification of current design |
+| **TDMA config** | Previous (conservative timing) | Current (*T*_slot = 2,000 µs) |
+| **Environment** | Indoor laboratory | University library |
+| **Duration** | 105.3 s | 7.2 s (pilot) |
 
-### 5.2. Quantitative Results
+### 6.2. Results
 
 | Metric | Run A | Run B |
 |:---|---:|---:|
-| Duration | 105.3 s | 7.2 s |
-| Total frames assembled | 1,959 | 880 |
-| Complete frames (12/12 links) | 1,387 | 286 |
+| Total frames | 1,959 | 880 |
+| Complete frames (12/12) | 1,387 | 286 |
 | Incomplete frames | 572 | 594 |
 | CRC errors | 4 | 4 |
-| **Frame completeness ratio** | **70.8%** | **32.5%** |
-| Total frame rate | 18.61 fps | 121.47 fps |
-| **Complete frame rate** | **13.17 fps** | **39.48 fps** |
-| Exported CSV frames | 1,387 | 286 |
+| **Completeness ratio** | **70.8%** | **32.5%** |
+| Total FPS | 18.61 | 121.47 |
+| **Complete FPS** | **13.17** | **39.48** |
 
-### 5.3. Analysis
+### 6.3. Analysis
 
-**Run A (previous configuration, 105.3 s)** achieved a frame completeness ratio of **70.8%**, indicating that approximately 7 out of every 10 TDMA cycles captured all 12 links. The total frame rate of 18.61 fps — substantially below the current configuration's theoretical maximum of 41.67 fps — reflects the use of a more conservative TDMA timing schedule with longer slot durations providing greater guard margins. The complete frame rate of 13.17 fps yielded **1,387 exportable frames**, demonstrating that the system operates stably over multi-minute sessions without memory leaks or synchronization loss.
+**Run A** used a previous, more conservative TDMA configuration (longer slot durations). The higher completeness (70.8%) reflects greater guard margins for retransmission at the cost of lower frame rate (13.17 fps). The system operated stably over 105 seconds, producing 1,387 clean frames without memory leaks or sync loss.
 
-**Run B (current configuration, university library, 7.2 s pilot)** achieved a complete frame rate of **39.48 fps**, corresponding to **94.7% of the theoretical maximum** (41.67 fps). This confirms that the 2,000 µs slot design is near-optimal in terms of throughput. However, the low completeness ratio (32.5%) indicates that the majority of cycles suffered at least one link failure, attributable to the dense WiFi environment of the university library (multiple co-channel access points, student devices). The elevated total frame rate of 121.47 fps (exceeding the single-cycle maximum) is an artifact of incomplete rounds being counted individually rather than occupying a full cycle period. This was a short-duration pilot measurement; extended campaigns under the current configuration are planned.
+**Run B** used the current configuration in a university library with significant ambient WiFi interference. The complete frame rate of **39.48 fps** reaches **94.7% of the theoretical maximum** (41.67 fps), confirming near-optimal TDMA utilization. The lower completeness (32.5%) is attributed to RF-level packet loss from co-channel interference, not insufficient retries.
 
-**CRC integrity:** Both runs recorded only **4 CRC errors** (< 0.3% of total frames), confirming effective data integrity over USB.
+**CRC integrity:** Only 4 errors across both runs (< 0.3%), confirming reliable USB data transfer.
 
-### 5.4. TDMA Parameter Sensitivity Analysis
+### 6.4. Parameter Trade-offs
 
-The contrast between Run A and Run B illustrates the fundamental trade-off between **frame rate** and **link reliability** in the TDMA design.
-
-#### 5.4.1. Slot Duration (*T*_slot)
-
-The maximum frame rate is inversely proportional to slot duration:
-
-> *f*_max = 1 / (*N*_slot × *T*_slot)
-
-| *T*_slot | *T*_cycle | *f*_max | *T*_guard | Trade-off |
-|---:|---:|---:|---:|:---|
-| 1,000 µs | 12 ms | 83.3 fps | 0 µs | ⚠️ No guard; high overflow risk |
-| 1,500 µs | 18 ms | 55.6 fps | 500 µs | ⚠️ Marginal guard for USB I/O |
-| **2,000 µs** | **24 ms** | **41.7 fps** | **1,000 µs** | ✅ **Current — balanced** |
-| 3,500 µs | 42 ms | 23.8 fps | 2,500 µs | Conservative; higher completeness |
-| 5,000 µs | 60 ms | 16.7 fps | 4,000 µs | Very conservative; diminishing returns |
-
-The higher completeness of Run A (70.8%) versus Run B (32.5%) is consistent with a longer slot duration providing more margin for processing and retransmission.
-
-#### 5.4.2. ACK Timeout (*T*_ack)
-
-| *T*_ack | Retries | *T*_active | *T*_guard | Impact |
-|---:|:---:|---:|---:|:---|
-| 300 µs | 1 | 600 µs | 1,400 µs | ⚠️ Premature timeout risk (ESP-NOW RTT: 200–400 µs) |
-| **500 µs** | **1** | **1,000 µs** | **1,000 µs** | ✅ **Current** |
-| 750 µs | 1 | 1,500 µs | 500 µs | Higher ACK rate; compressed guard |
-| 500 µs | 2 | 1,500 µs | 500 µs | Additional retry; same guard reduction |
-
-#### 5.4.3. Retry Count (*R*)
-
-| Retries | *T*_active | *T*_guard | Note |
-|:---:|---:|---:|:---|
-| 0 | 500 µs | 1,500 µs | Baseline; single attempt |
-| **1** | **1,000 µs** | **1,000 µs** | ✅ **Current** |
-| 2 | 1,500 µs | 500 µs | Diminishing returns |
-| 3 | 2,000 µs | 0 µs | ⚠️ Entire slot consumed |
-
-The measured 32.5% completeness in the library environment suggests that **RF-level interference** — not insufficient retries — is the dominant loss mechanism. Environmental mitigations (channel selection, antenna placement, power tuning) are likely more effective.
-
-#### 5.4.4. Network Scaling
-
-| Nodes (*N*) | Links | *T*_cycle | *f*_max |
-|:---:|:---:|---:|---:|
-| 3 | 6 | 12 ms | 83.3 fps |
-| **4** | **12** | **24 ms** | **41.7 fps** |
-| 5 | 20 | 40 ms | 25.0 fps |
-| 6 | 30 | 60 ms | 16.7 fps |
-
-The frame rate degrades as *f*_max ∝ 1/*N*², representing a fundamental scalability constraint of the full-mesh topology.
+| Parameter | ↓ Decrease | ↑ Increase |
+|:---|:---|:---|
+| **Slot duration** (2,000 µs) | Higher FPS, less guard → more drops | Lower FPS, more guard → better completeness |
+| **ACK timeout** (500 µs) | Risk premature timeout (RTT ~200–400 µs) | Less guard time for CRC/USB |
+| **Retries** (1) | Fewer recovery chances | Consumes guard; diminishing returns |
+| **Nodes** (*N*=4) | Fewer links, higher FPS (*f* ∝ 1/*N*²) | More spatial diversity, lower FPS |
 
 ---
 
-## 6. Limitations and Future Work
+## 7. Limitations and Future Work
 
-The following items have **not** been systematically evaluated under controlled conditions:
-
-- [ ] Extended measurement campaigns (> 10 min) under the current TDMA configuration
-- [ ] Quantitative SNR improvement per filter stage (Hampel, Gaussian, PCA)
-- [ ] Optimal PCA component count (*k*) across different activity types
-- [ ] End-to-end latency: CSI extraction → processed 52×5 matrix availability
-- [ ] Downstream AI model accuracy (HAR, Pose Estimation) on processed features
-- [ ] Completeness comparison across WiFi channels, power levels, and node geometries
+- [ ] Extended measurements (> 10 min) under current configuration
+- [ ] Quantitative SNR improvement per filter stage
+- [ ] Optimal PCA components (*k*) across activity types
+- [ ] End-to-end latency characterization
+- [ ] Downstream AI model accuracy (HAR, Pose Estimation)
 
 ---
 
 ## Project Structure
 
 ```
-csi_sync_project/
-├── main/
-│   └── main.c                  # ESP32-C3 firmware (TDMA + CSI + binary protocol)
-├── python/
-│   ├── csi_receiver.py         # Multi-threaded binary CSI receiver
-│   ├── csi_processor.py        # Hampel + Gaussian + PCA pipeline + real-time plot
-│   ├── analyze_pca.py          # PCA analysis utilities
-│   └── verify_pca_fix.py       # PCA sign alignment verification
+├── README.md                       # This document
 ├── docs/
-│   └── system_architecture.png # System overview diagram (Figure 1)
-├── readme/
-│   ├── CSI.md                  # Detailed synchronization mechanism documentation
-│   └── noise_filter_report.md  # Mathematical derivations of filter algorithms
-├── csi_data/                   # Collected CSI datasets (CSV)
-├── CMakeLists.txt              # ESP-IDF build configuration
-├── sdkconfig                   # ESP-IDF SDK configuration
-└── README.md                   # This file
+│   └── system_architecture.png     # System overview diagram (Figure 1)
+├── main/
+│   └── main.c                      # ESP32-C3 firmware (TDMA scheduler + CSI extraction + binary protocol)
+└── python/
+    ├── csi_receiver.py             # Multi-threaded binary CSI receiver + frame assembly
+    └── csi_processor.py            # Hampel + Gaussian + PCA pipeline + real-time visualization
 ```
-
----
 
 ## Quick Start
 
 ```bash
-# 1. Flash firmware to all 4 ESP32-C3 nodes
+# Flash firmware to all 4 ESP32-C3 nodes (ESP-IDF required)
 idf.py build flash monitor
 
-# 2. Run CSI receiver only (raw data collection)
-cd python
-python csi_receiver.py
+# Run raw CSI collection only
+python python/csi_receiver.py
 
-# 3. Run full pipeline (receiver + filter + real-time plot)
-cd python
-python csi_processor.py
+# Run full pipeline with real-time plot
+python python/csi_processor.py
 ```
 
 ---
 
-## License
-
-This project is developed for academic research purposes.
+*This project is developed for academic research purposes.*
